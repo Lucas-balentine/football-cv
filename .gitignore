@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Model weights
+*.pt
+*.onnx
+
+# Output
+output/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
