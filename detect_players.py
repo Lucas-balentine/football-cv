@@ -1,8 +1,9 @@
 """
-Baseline player detection using COCO-pretrained YOLOv8m.
+Player detection and team classification pipeline.
 
 Runs person detection (COCO class 0) on input images, filters detections
-to only those standing on the green playing field, and saves annotated
+to only those standing on the green playing field, classifies each player
+into one of two teams via jersey color clustering, and saves annotated
 results to the output/ directory.
 """
 
@@ -12,6 +13,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+from team_classifier import classify_teams
 
 # COCO class 0 = person
 PERSON_CLASS_ID = 0
@@ -100,29 +103,56 @@ def detect_players(image_paths: list[str], confidence: float = 0.3) -> None:
         removed = total - filtered
         print(f"  Detected {total} people, kept {filtered} on-field ({removed} filtered out)")
 
-        # Print kept detections
+        # Extract crops for on-field players
+        crops = []
+        for i in kept_indices:
+            x1, y1, x2, y2 = [int(v) for v in result.boxes[i].xyxy[0].tolist()]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
+            crops.append(image[y1:y2, x1:x2])
+
+        # Classify teams
+        team_labels, embeddings = classify_teams(crops)
+
+        # Team colors for drawing (BGR) — distinct visual colors per team
+        TEAM_COLORS = {
+            0: (0, 165, 255),   # orange
+            1: (255, 50, 50),   # blue
+            -1: (180, 180, 180),  # gray for unclassified
+        }
+
+        # Report team split
+        for t in range(2):
+            count = sum(1 for l in team_labels if l == t)
+            print(f"  Team {t}: {count} players")
+
+        # Print kept detections with team labels
         for rank, i in enumerate(kept_indices):
             box = result.boxes[i]
             conf = box.conf.item()
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             w = x2 - x1
             h = y2 - y1
-            print(f"  [{rank+1}] conf={conf:.2f}  size={w:.0f}x{h:.0f}px")
+            team = team_labels[rank]
+            team_str = f"Team {team}" if team >= 0 else "???"
+            print(f"  [{rank+1}] conf={conf:.2f}  size={w:.0f}x{h:.0f}px  {team_str}")
 
-        # Draw only kept detections on the image
+        # Draw detections colored by team
         annotated = image.copy()
-        for i in kept_indices:
+        for rank, i in enumerate(kept_indices):
             box = result.boxes[i]
             conf = box.conf.item()
+            team = team_labels[rank]
+            color = TEAM_COLORS[team]
             x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 144, 30), 2)
-            label = f"person {conf:.2f}"
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            label = f"T{team} {conf:.2f}" if team >= 0 else f"??? {conf:.2f}"
             cv2.putText(
                 annotated, label, (x1, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 144, 30), 2,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
             )
 
-        output_path = output_dir / f"{path.stem}_detections{path.suffix}"
+        output_path = output_dir / f"{path.stem}_teams{path.suffix}"
         cv2.imwrite(str(output_path), annotated)
         print(f"  Saved → {output_path}")
 
