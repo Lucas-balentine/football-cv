@@ -9,9 +9,36 @@ env/
 # Model weights
 *.pt
 *.onnx
+models/
 
 # Output
 output/
+
+# Training runs & logs
+runs/
+*.log
+
+# Auto-generated absolute-path data.yaml
+**/data_abs.yaml
+
+# Training datasets
+datasets/
+nfl-big-data-bowl-2020/
+Hash Yards Intersection.v6i.yolov11/
+
+# Images & videos
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.WEBP
+videos/
+
+# Environment / secrets
+.env
+
+# Claude Code
+.claude/
 
 # OS
 .DS_Store
