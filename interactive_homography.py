@@ -12,6 +12,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import sys
 import cv2
 import numpy as np
 
@@ -365,6 +366,7 @@ def detect_field_grid(
     high_conf: int = 25,
     low_conf: int = 10,
     snap_radius: float = 50.0,
+    offense_direction: str | None = None,
 ) -> FieldGrid:
     """Detect field grid using the hash-yards-intersection model.
 
@@ -390,7 +392,15 @@ def detect_field_grid(
     anchors = [p for p in all_preds if p["confidence"] >= high_threshold]
     candidates = [p for p in all_preds if p["confidence"] < high_threshold]
 
+    print(f"[GRID] Raw detections: {len(all_preds)} total, {len(anchors)} anchors (>={high_conf}%), {len(candidates)} candidates (<{high_conf}%)", flush=True)
+    for p in all_preds:
+        print(f"  det ({p['x']:.0f},{p['y']:.0f}) conf={p['confidence']:.2f} class={p['class']}", flush=True)
+
     recovered = _recover_grid_candidates(anchors, candidates, snap_radius)
+    print(f"[GRID] Recovered {len(recovered)} low-conf candidates", flush=True)
+    for p in recovered:
+        print(f"  recovered ({p['x']:.0f},{p['y']:.0f}) conf={p['confidence']:.2f}", flush=True)
+
     for p in anchors:
         p["_recovered"] = False
     final_dets = anchors + recovered
@@ -407,6 +417,8 @@ def detect_field_grid(
     # low-confidence recovered points cannot corrupt the geometry.
     anchor_centers = [(p["x"], p["y"]) for p in anchor_hashes]
     vec_along, vec_across = _estimate_grid_vectors(anchor_centers)
+    print(f"[GRID] {len(anchor_centers)} anchor points", flush=True)
+    print(f"[GRID] vec_along={vec_along}, vec_across={vec_across}", flush=True)
 
     if vec_across is None:
         return FieldGrid(
@@ -420,6 +432,13 @@ def detect_field_grid(
     # We cluster by projecting onto the axis *perpendicular* to
     # vec_along — same-yard-line hashes get the same projection.
     groups = _cluster_into_yard_lines(hash_marks, vec_across, vec_along)
+    print(f"[GRID] {len(groups)} yard-line groups, {len(hash_marks)} total hash marks", flush=True)
+    for i, g in enumerate(groups):
+        pts = g["points"]
+        cx, cy = g["centroid"]
+        pt_detail = ", ".join(f"({p['x']:.0f},{p['y']:.0f})" for p in pts)
+        print(f"  group {i}: {len(pts)} pts, centroid=({cx:.0f},{cy:.0f})  points=[{pt_detail}]", flush=True)
+    sys.stdout.flush()
 
     if not groups:
         return FieldGrid(
@@ -427,6 +446,13 @@ def detect_field_grid(
             grid_vec_along=vec_along,
             grid_vec_across=vec_across,
         )
+
+    # ── Sort groups by projection onto vec_across ─────────────────────
+    # Ensures consistent ordering regardless of vec_along direction.
+    # vec_across is canonicalized to the positive-x half-plane, so
+    # sorting by projection gives a consistent left-to-right order.
+    across_norm = vec_across / np.linalg.norm(vec_across)
+    groups.sort(key=lambda g: g["centroid"][0] * across_norm[0] + g["centroid"][1] * across_norm[1])
 
     # ── Anchor yard numbers to ball position ─────────────────────────
     center_yard = round(ball_yard / 5) * 5
@@ -449,8 +475,20 @@ def detect_field_grid(
     else:
         anchor_idx = len(groups) // 2
 
+    # Determine yard-number step direction based on offense direction.
+    # Groups are sorted left-to-right (ascending vec_across projection).
+    # When offense goes RIGHT, they attack the right endzone (yard 100),
+    #   so internal yards INCREASE left→right → step = +5.
+    # When offense goes LEFT, they attack the left endzone (yard 0),
+    #   so internal yards DECREASE left→right → step = -5.
+    yard_step = -5 if offense_direction == "left" else 5
+
     for i, g in enumerate(groups):
-        g["yard"] = center_yard + (i - anchor_idx) * 5
+        g["yard"] = center_yard + (i - anchor_idx) * yard_step
+    print(f"[GRID] offense_direction={offense_direction}, yard_step={yard_step}", flush=True)
+    print(f"[GRID] anchor_idx={anchor_idx}, center_yard={center_yard}", flush=True)
+    for i, g in enumerate(groups):
+        print(f"  group {i}: yard={g['yard']}, centroid=({g['centroid'][0]:.0f},{g['centroid'][1]:.0f})", flush=True)
 
     # Clamp: drop any groups that fall outside 0-100
     groups = [g for g in groups if 0 <= g["yard"] <= 100]
@@ -471,6 +509,7 @@ def detect_field_grid(
     # ── Project full grid ────────────────────────────────────────────
     yard_line_groups, projected = _project_full_grid(
         groups, vec_along, vec_across, image.shape, anchor_idx, center_yard,
+        yard_step=yard_step,
     )
 
     return FieldGrid(
@@ -536,6 +575,40 @@ def _cluster_into_yard_lines(
             current_group = [projections[i]]
     groups.append(current_group)
 
+    # ── Merge adjacent single-point groups that are a hash pair ───────
+    # Two consecutive 1-point groups whose displacement aligns with
+    # vec_along (the hash-pair direction) are on the same yard line
+    # but were split by perspective distortion.  Merge them if:
+    #   1) Both groups have exactly 1 point
+    #   2) Their gap is less than 0.7 * across_mag (well under a full
+    #      5-yard spacing, so we won't merge different yard lines)
+    #   3) Their displacement is more along vec_along than across it
+    if vec_along is not None and np.linalg.norm(vec_along) > 1:
+        along_norm = vec_along / np.linalg.norm(vec_along)
+        merged = []
+        i = 0
+        while i < len(groups):
+            if (i + 1 < len(groups)
+                    and len(groups[i]) == 1
+                    and len(groups[i + 1]) == 1):
+                p1 = groups[i][0][1]
+                p2 = groups[i + 1][0][1]
+                dx = p2["x"] - p1["x"]
+                dy = p2["y"] - p1["y"]
+                disp = np.array([dx, dy])
+                gap = abs(groups[i + 1][0][0] - groups[i][0][0])
+                # Check alignment: component along vec_along should
+                # dominate the component perpendicular to it
+                along_comp = abs(disp @ along_norm)
+                perp_comp = abs(disp @ perp)
+                if gap < 0.7 * across_mag and along_comp > perp_comp:
+                    merged.append(groups[i] + groups[i + 1])
+                    i += 2
+                    continue
+            merged.append(groups[i])
+            i += 1
+        groups = merged
+
     result = []
     for g in groups:
         points = [item[1] for item in g]
@@ -558,6 +631,7 @@ def _project_full_grid(
     img_shape: tuple,
     anchor_idx: int,
     anchor_yard: int,
+    yard_step: int = 5,
 ) -> tuple[list[dict], list[dict]]:
     """Extrapolate the full field grid from detected yard-line groups.
 
@@ -588,7 +662,7 @@ def _project_full_grid(
 
         while True:
             next_i = i + direction
-            yard = anchor_yard + (next_i - anchor_idx) * 5
+            yard = anchor_yard + (next_i - anchor_idx) * yard_step
             if yard < 0 or yard > 100:
                 break
 
@@ -693,6 +767,8 @@ def compute_grid_homography(
     detected = [p for p in grid.projected_intersections if p["detected"]]
     if len(detected) < 3:
         return None
+    print(f"[H] ball_image_pos={ball_image_pos}, ball_template_pos={ball_template_pos}", flush=True)
+    print(f"[H] {len(detected)} detected points across yards: {sorted(set(p['yard'] for p in detected))}", flush=True)
 
     by_yard: dict[int, list[dict]] = {}
     for p in detected:
@@ -700,38 +776,8 @@ def compute_grid_homography(
 
     near_hash_x, far_hash_x = _hash_template_x(field_type)
 
-    # ── Phase 1: Fixed correspondences from multi-detection yard lines ──
-    base_src: list[list[float]] = []
-    base_dst: list[list[float]] = []
-
-    for yard, pts in by_yard.items():
-        template_y = yard_to_template_y(yard)
-        if not (0 <= template_y <= TEMPLATE_H):
-            continue
-        if len(pts) < 2:
-            continue
-
-        # Sort by y descending: highest y = closest to camera = near
-        pts.sort(key=lambda p: p["y"], reverse=True)
-        base_src.append([float(pts[0]["x"]), float(pts[0]["y"])])
-        base_dst.append([near_hash_x, template_y])
-        base_src.append([float(pts[-1]["x"]), float(pts[-1]["y"])])
-        base_dst.append([far_hash_x, template_y])
-
-        # Middle points interpolate between near and far
-        for k in range(1, len(pts) - 1):
-            frac = k / (len(pts) - 1)
-            tx = near_hash_x + frac * (far_hash_x - near_hash_x)
-            base_src.append([pts[k]["x"], pts[k]["y"]])
-            base_dst.append([tx, template_y])
-
-    # Ball position as fixed correspondence
-    if ball_image_pos is not None and ball_template_pos is not None:
-        base_src.append([float(ball_image_pos[0]), float(ball_image_pos[1])])
-        base_dst.append([float(ball_template_pos[0]), float(ball_template_pos[1])])
-
-    # ── Phase 2: Collect single-detection yard lines ─────────────────
-    singles: list[tuple[int, float, float]] = []   # (yard, px, py)
+    # ── Collect single-detection yard lines ─────────────────────────
+    singles: list[tuple[int, float, float]] = []
     for yard, pts in by_yard.items():
         template_y = yard_to_template_y(yard)
         if not (0 <= template_y <= TEMPLATE_H):
@@ -740,49 +786,163 @@ def compute_grid_homography(
             continue
         singles.append((yard, pts[0]["x"], pts[0]["y"]))
 
-    # ── Phase 3: Enumerate near/far assignments, pick best H ─────────
-    # For each single-detection yard line, the detection could be at
-    # the near hash or the far hash.  We try all 2^N combinations and
-    # select the homography with the lowest condition number.
     n_singles = len(singles)
 
-    if n_singles == 0:
-        # No ambiguity — just use base correspondences
-        if len(base_src) < 4:
-            return None
-        src = np.array(base_src, dtype=np.float32)
-        dst = np.array(base_dst, dtype=np.float32)
-        H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-        return H
-
+    # ── Try both near/far orientations for multi-detection groups ─────
+    # "highest image-y = near" doesn't hold for all camera angles.
+    # Try normal and flipped, score by reprojection error.
     best_H = None
-    best_cond = float("inf")
+    best_err = float("inf")
 
-    for combo in range(1 << n_singles):
-        src_pts = list(base_src)
-        dst_pts = list(base_dst)
+    for flip_multi in (False, True):
+        base_src: list[list[float]] = []
+        base_dst: list[list[float]] = []
 
-        for bit_idx, (yard, px, py) in enumerate(singles):
+        for yard, pts in by_yard.items():
             template_y = yard_to_template_y(yard)
-            is_far = (combo >> bit_idx) & 1
-            tx = far_hash_x if is_far else near_hash_x
-            src_pts.append([float(px), float(py)])
-            dst_pts.append([tx, template_y])
+            if not (0 <= template_y <= TEMPLATE_H):
+                continue
+            if len(pts) < 2:
+                continue
+            pts.sort(key=lambda p: p["y"], reverse=True)
+            if flip_multi:
+                base_src.append([float(pts[0]["x"]), float(pts[0]["y"])])
+                base_dst.append([far_hash_x, template_y])
+                base_src.append([float(pts[-1]["x"]), float(pts[-1]["y"])])
+                base_dst.append([near_hash_x, template_y])
+            else:
+                base_src.append([float(pts[0]["x"]), float(pts[0]["y"])])
+                base_dst.append([near_hash_x, template_y])
+                base_src.append([float(pts[-1]["x"]), float(pts[-1]["y"])])
+                base_dst.append([far_hash_x, template_y])
+            for k in range(1, len(pts) - 1):
+                frac = k / (len(pts) - 1)
+                if flip_multi:
+                    tx = far_hash_x + frac * (near_hash_x - far_hash_x)
+                else:
+                    tx = near_hash_x + frac * (far_hash_x - near_hash_x)
+                base_src.append([pts[k]["x"], pts[k]["y"]])
+                base_dst.append([tx, template_y])
 
-        if len(src_pts) < 4:
+        if ball_image_pos is not None and ball_template_pos is not None:
+            base_src.append([float(ball_image_pos[0]), float(ball_image_pos[1])])
+            base_dst.append([float(ball_template_pos[0]), float(ball_template_pos[1])])
+
+        if n_singles == 0:
+            if len(base_src) < 4:
+                continue
+            src = np.array(base_src, dtype=np.float32)
+            dst = np.array(base_dst, dtype=np.float32)
+            H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+            if H is not None:
+                projected = cv2.perspectiveTransform(
+                    src.reshape(-1, 1, 2), H).reshape(-1, 2)
+                err = np.mean(np.linalg.norm(projected - dst, axis=1))
+                print(f"[H] flip={flip_multi} reproj={err:.2f}", flush=True)
+                if err < best_err:
+                    best_err = err
+                    best_H = H
             continue
 
-        src = np.array(src_pts, dtype=np.float32)
-        dst = np.array(dst_pts, dtype=np.float32)
+        for combo in range(1 << n_singles):
+            src_pts = list(base_src)
+            dst_pts = list(base_dst)
+            for bit_idx, (yard, px, py) in enumerate(singles):
+                template_y = yard_to_template_y(yard)
+                is_far = (combo >> bit_idx) & 1
+                tx = far_hash_x if is_far else near_hash_x
+                src_pts.append([float(px), float(py)])
+                dst_pts.append([tx, template_y])
+            if len(src_pts) < 4:
+                continue
+            src = np.array(src_pts, dtype=np.float32)
+            dst = np.array(dst_pts, dtype=np.float32)
+            H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+            if H is None:
+                continue
+            projected = cv2.perspectiveTransform(
+                src.reshape(-1, 1, 2), H).reshape(-1, 2)
+            err = np.mean(np.linalg.norm(projected - dst, axis=1))
+            if err < best_err:
+                best_err = err
+                best_H = H
+                print(f"[H] NEW BEST flip={flip_multi} combo={combo} reproj={err:.2f}", flush=True)
 
-        H, status = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-        if H is None:
-            continue
+    print(f"[H] FINAL best_err={best_err:.2f}", flush=True)
 
-        cond = np.linalg.cond(H)
-        if cond < best_cond:
-            best_cond = cond
-            best_H = H
+    # ── Conditional singles check ──────────────────────────────────────
+    # If singles exist, check whether they're pulling the fit off.
+    # Compute an alternative H from paired groups + ball only, and
+    # compare how each fits the PAIRED-GROUP-ONLY points.  If the
+    # full-H (with singles) fits pairs noticeably worse than the
+    # pairs-only H, the singles are hurting — use pairs-only instead.
+    if n_singles > 0 and best_H is not None:
+        # Build paired-only correspondences (both flip orientations)
+        pair_points: list[tuple[list[float], list[float]]] = []  # (src, dst)
+        best_pair_H = None
+        best_pair_err = float("inf")
+
+        for flip_p in (False, True):
+            p_src: list[list[float]] = []
+            p_dst: list[list[float]] = []
+            for yard, pts in by_yard.items():
+                template_y = yard_to_template_y(yard)
+                if not (0 <= template_y <= TEMPLATE_H):
+                    continue
+                if len(pts) < 2:
+                    continue
+                pts_s = sorted(pts, key=lambda p: p["y"], reverse=True)
+                if flip_p:
+                    p_src.append([float(pts_s[0]["x"]), float(pts_s[0]["y"])])
+                    p_dst.append([far_hash_x, template_y])
+                    p_src.append([float(pts_s[-1]["x"]), float(pts_s[-1]["y"])])
+                    p_dst.append([near_hash_x, template_y])
+                else:
+                    p_src.append([float(pts_s[0]["x"]), float(pts_s[0]["y"])])
+                    p_dst.append([near_hash_x, template_y])
+                    p_src.append([float(pts_s[-1]["x"]), float(pts_s[-1]["y"])])
+                    p_dst.append([far_hash_x, template_y])
+
+            if ball_image_pos is not None and ball_template_pos is not None:
+                p_src.append([float(ball_image_pos[0]), float(ball_image_pos[1])])
+                p_dst.append([float(ball_template_pos[0]), float(ball_template_pos[1])])
+
+            if len(p_src) < 4:
+                continue
+
+            src_np = np.array(p_src, dtype=np.float32)
+            dst_np = np.array(p_dst, dtype=np.float32)
+            H_p, _ = cv2.findHomography(src_np, dst_np, cv2.RANSAC, 5.0)
+            if H_p is None:
+                continue
+            proj = cv2.perspectiveTransform(
+                src_np.reshape(-1, 1, 2), H_p).reshape(-1, 2)
+            err_p = np.mean(np.linalg.norm(proj - dst_np, axis=1))
+            if err_p < best_pair_err:
+                best_pair_err = err_p
+                best_pair_H = H_p
+                # Save the pair-only src/dst for scoring best_H later
+                pair_points = [(list(s), list(d)) for s, d in zip(p_src, p_dst)]
+
+        if best_pair_H is not None and pair_points:
+            # Score the full-H (with singles) on the paired-only points
+            pair_src_np = np.array([s for s, _ in pair_points], dtype=np.float32)
+            pair_dst_np = np.array([d for _, d in pair_points], dtype=np.float32)
+            proj_full = cv2.perspectiveTransform(
+                pair_src_np.reshape(-1, 1, 2), best_H).reshape(-1, 2)
+            full_err_on_pairs = np.mean(np.linalg.norm(proj_full - pair_dst_np, axis=1))
+
+            print(f"[H] pairs-only H fits pairs at {best_pair_err:.2f}px; "
+                  f"full H fits pairs at {full_err_on_pairs:.2f}px", flush=True)
+
+            # If singles pull the fit off by more than 1.5px on the paired
+            # points, the singles are hurting — drop them.
+            DROP_THRESHOLD = 1.5
+            if full_err_on_pairs > best_pair_err + DROP_THRESHOLD:
+                print(f"[H] Singles hurting fit — dropping them, using pairs-only H", flush=True)
+                best_H = best_pair_H
+            else:
+                print(f"[H] Singles consistent with pairs — keeping full H", flush=True)
 
     return best_H
 
@@ -1402,17 +1562,46 @@ def _segmentation_detect(image_bgr: np.ndarray) -> list[dict]:
             api_url="https://serverless.roboflow.com",
             api_key=api_key,
         )
+        # Use inline specification — the deployed workflow has empty
+        # steps/outputs (config bug). The spec below is copied from the
+        # workflow's lastVersionConfig (roboflow_core/seg-preview@v1 + SAM).
+        seg_spec = {
+            "version": "1.0",
+            "inputs": [
+                {"type": "WorkflowParameter", "name": "classes"},
+                {"type": "InferenceImage", "name": "image"},
+            ],
+            "steps": [
+                {
+                    "type": "roboflow_core/seg-preview@v1",
+                    "name": "sam",
+                    "images": "$inputs.image",
+                    "class_names": "$inputs.classes",
+                }
+            ],
+            "outputs": [
+                {
+                    "type": "JsonField",
+                    "name": "predictions",
+                    "coordinates_system": "own",
+                    "selector": "$steps.sam.predictions",
+                }
+            ],
+        }
         result = client.run_workflow(
-            workspace_name="isaiahs-workspace",
-            workflow_id="general-segmentation-api-3",
+            specification=seg_spec,
             images={"image": tmp_path},
-            parameters={"classes": "player, ref"},
-            use_cache=True,
+            parameters={"classes": ["player", "ref"]},
         )
         os.unlink(tmp_path)
 
+        print(f"[SEG] result keys: {list(result[0].keys()) if result else 'empty'}", flush=True)
         preds = result[0]["predictions"]["predictions"]
-    except Exception:
+        print(f"[SEG] got {len(preds)} predictions", flush=True)
+    except Exception as e:
+        import traceback
+        print(f"[SEG] ERROR: {e}", flush=True)
+        traceback.print_exc()
         return []
 
     h, w = image_bgr.shape[:2]
@@ -1893,7 +2082,8 @@ def run_interactive_homography(
     H = None
     assignments = []
     try:
-        grid = detect_field_grid(image, ball_yard, ball_image_pos=ball_image_pos)
+        grid = detect_field_grid(image, ball_yard, ball_image_pos=ball_image_pos,
+                                    offense_direction=offense_direction)
         detected_count = sum(1 for p in grid.projected_intersections if p["detected"])
         if detected_count >= 2:
             H = compute_grid_homography(
@@ -1907,21 +2097,9 @@ def run_interactive_homography(
     except Exception:
         pass
 
-    # Step 2: Fallback to Hough-based detection
-    if H is None:
-        markings = detect_field_markings(image)
-        if markings.yard_lines:
-            assignments = assign_yard_numbers(markings, ball_yard, image.shape)
-            if len(assignments) >= 2:
-                H = compute_anchored_homography(
-                    assignments, markings.dominant_angle, image.shape,
-                    markings=markings,
-                    ball_image_pos=ball_image_pos,
-                    ball_template_pos=ball_template_pos,
-                    field_type=field_type,
-                )
-                if H is not None:
-                    homography_source = "hough"
+    # Step 2: Hough fallback disabled — hash marks + ball position only.
+    # The Hough path picks up painted yard numbers as false yard lines,
+    # corrupting the homography.  Hash detection is reliable enough.
 
     # Step 3: Draw field overlay (always, even if homography fails)
     if grid is not None:
@@ -1990,6 +2168,15 @@ def run_interactive_homography(
         team_labels, team_diags = classify_teams_multi(
             field_players, image, ball_yard, offense_direction,
         )
+        print(f"[TEAM] n_players={len(team_labels)}, "
+              f"labels={team_labels}", flush=True)
+        print(f"[TEAM] ball_yard={ball_yard} dir={offense_direction}", flush=True)
+        for i, (p, d) in enumerate(zip(field_players, team_diags)):
+            yd = p.get("yard", "?")
+            has_mask = p.get("mask") is not None
+            print(f"  p{i}: yard={yd} zone={d['position_zone']} "
+                  f"pos_sig={d['position_signal']} col_sig={d['color_signal']} "
+                  f"hsv={d['color_hsv']} mask={has_mask}", flush=True)
     # ── Post-process: flip obvious outliers on wrong side of ball ──────
     #   After team labels are assigned (either precomputed or fresh), a
     #   single player may still be mislabelled.  If one side of the LOS

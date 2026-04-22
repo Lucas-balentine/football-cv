@@ -53,6 +53,7 @@ from interactive_homography import (
 )
 from field_homography import TEMPLATE_SCALE, FIELD_WIDTH_YD
 from playbook_renderer import render_playbook
+from presnap_extractor import extract_presnap_frames
 from team_classifier import classify_teams, classify_teams_multi
 
 load_dotenv()
@@ -2691,6 +2692,199 @@ def build_app() -> gr.Blocks:
                     _use_as_input,
                     inputs=[frame_slider, video_meta_state],
                     outputs=[input_image, extract_status],
+                )
+
+            # ── Tab 11: Pre-Snap Extractor ───────────────────────────
+            with gr.TabItem("Pre-Snap Extractor"):
+                gr.Markdown(
+                    "## Pre-Snap Frame Extractor\n"
+                    "Automatically extract one pre-snap frame per play from a game video. "
+                    "Uses scene-cut detection, motion analysis, and formation confirmation "
+                    "to find the moment right before the snap.\n\n"
+                    "Extracted frames are saved as PNGs to `videos/presnap/<video>/`."
+                )
+
+                def _scan_presnap_videos():
+                    import glob as _glob
+                    files = []
+                    for p in ["videos/*.mp4", "videos/*.avi", "videos/*.mov", "*.mp4"]:
+                        files.extend(_glob.glob(p))
+                    return sorted(set(files))
+
+                with gr.Row():
+                    ps_video_input = gr.Dropdown(
+                        label="Video file",
+                        choices=_scan_presnap_videos(),
+                        interactive=True,
+                        allow_custom_value=True,
+                    )
+                    ps_refresh_btn = gr.Button("Refresh", size="sm")
+
+                with gr.Row():
+                    ps_min_duration = gr.Slider(
+                        minimum=1.0, maximum=10.0, step=0.5, value=2.0,
+                        label="Min segment duration (seconds)",
+                    )
+                    ps_scene_thresh = gr.Slider(
+                        minimum=0.3, maximum=0.9, step=0.05, value=0.65,
+                        label="Scene-cut sensitivity (lower = more cuts)",
+                    )
+
+                with gr.Row():
+                    ps_extract_btn = gr.Button(
+                        "Extract Pre-Snap Frames", variant="primary", size="lg",
+                    )
+
+                ps_progress = gr.Textbox(
+                    label="Progress", interactive=False, lines=2,
+                    value="Ready. Select a video and click Extract.",
+                )
+
+                ps_gallery = gr.Gallery(
+                    label="Extracted Pre-Snap Frames",
+                    columns=4,
+                    height=400,
+                    object_fit="contain",
+                )
+
+                with gr.Row():
+                    ps_frame_info = gr.Textbox(
+                        label="Selected frame info", interactive=False, lines=3,
+                    )
+
+                with gr.Row():
+                    ps_use_btn = gr.Button(
+                        "Use Selected as Pipeline Input", variant="secondary",
+                    )
+                    ps_status = gr.Textbox(
+                        label="Status", interactive=False,
+                    )
+
+                # Hidden state for results and selection
+                ps_results_state = gr.State(value=[])
+                ps_selected_idx = gr.State(value=None)
+
+                def _ps_refresh_list():
+                    videos = _scan_presnap_videos()
+                    return gr.update(choices=videos, value=videos[0] if videos else None)
+
+                def _ps_run_extraction(video_path, min_dur, scene_thresh):
+                    """Run the 3-layer pre-snap extraction pipeline."""
+                    if not video_path or not os.path.exists(video_path):
+                        return (
+                            [],
+                            f"Video not found: {video_path!r}",
+                            [],
+                            "",
+                        )
+
+                    video_stem = Path(video_path).stem
+                    out_dir = f"videos/presnap/{video_stem}"
+
+                    # Progress messages accumulate here
+                    status_lines = []
+
+                    def _progress(current, total, msg):
+                        status_lines.append(msg)
+
+                    try:
+                        results = extract_presnap_frames(
+                            video_path,
+                            out_dir,
+                            min_segment_duration=min_dur,
+                            scene_threshold=scene_thresh,
+                            progress_callback=_progress,
+                        )
+                    except Exception as e:
+                        return (
+                            [],
+                            f"Error: {e}",
+                            [],
+                            "",
+                        )
+
+                    if not results:
+                        return (
+                            [],
+                            "No pre-snap frames found. Try adjusting sensitivity.",
+                            [],
+                            "",
+                        )
+
+                    # Build gallery entries: list of (filepath, label) tuples
+                    gallery_items = []
+                    for r in results:
+                        label = (
+                            f"Play {r['play_number']} | {r['timestamp']} | "
+                            f"{r['confidence']}"
+                        )
+                        gallery_items.append((r["output_path"], label))
+
+                    summary = (
+                        f"Extracted {len(results)} pre-snap frames from "
+                        f"{len(status_lines)} segments.\n"
+                        f"Saved to: {out_dir}/\n"
+                        f"High confidence: "
+                        f"{sum(1 for r in results if r['confidence'] == 'high')}, "
+                        f"Medium: "
+                        f"{sum(1 for r in results if r['confidence'] == 'medium')}"
+                    )
+
+                    return gallery_items, summary, results, ""
+
+                def _ps_select_frame(evt: gr.SelectData, results):
+                    """Show info about the selected gallery frame."""
+                    if not results or evt.index >= len(results):
+                        return "No frame selected", None
+
+                    r = results[evt.index]
+                    info = (
+                        f"Play #{r['play_number']}\n"
+                        f"Frame: {r['frame_number']}  |  "
+                        f"Timestamp: {r['timestamp']}\n"
+                        f"Confidence: {r['confidence']}  |  "
+                        f"Segment: {r['segment'][0]}-{r['segment'][1]}\n"
+                        f"File: {r['output_path']}"
+                    )
+                    return info, evt.index
+
+                def _ps_use_as_input(selected_idx, results):
+                    """Load selected pre-snap frame into the main pipeline input."""
+                    if selected_idx is None or not results:
+                        return None, "No frame selected — click a frame first"
+                    if selected_idx >= len(results):
+                        return None, "Invalid selection"
+
+                    r = results[int(selected_idx)]
+                    img = cv2.imread(r["output_path"])
+                    if img is None:
+                        return None, f"Could not read {r['output_path']}"
+
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    return img_rgb, f"Loaded play {r['play_number']} into pipeline"
+
+                # Wire up events
+                ps_refresh_btn.click(
+                    _ps_refresh_list,
+                    outputs=[ps_video_input],
+                )
+
+                ps_extract_btn.click(
+                    _ps_run_extraction,
+                    inputs=[ps_video_input, ps_min_duration, ps_scene_thresh],
+                    outputs=[ps_gallery, ps_progress, ps_results_state, ps_frame_info],
+                )
+
+                ps_gallery.select(
+                    _ps_select_frame,
+                    inputs=[ps_results_state],
+                    outputs=[ps_frame_info, ps_selected_idx],
+                )
+
+                ps_use_btn.click(
+                    _ps_use_as_input,
+                    inputs=[ps_selected_idx, ps_results_state],
+                    outputs=[input_image, ps_status],
                 )
 
         # Sync Game Setup direction → Field Mapping direction

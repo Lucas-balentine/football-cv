@@ -46,3 +46,9 @@ videos/
 # IDE
 .vscode/
 .idea/
+
+# Backups / debug snapshots
+*.backup
+*.today_broken
+frames/
+test_film*
