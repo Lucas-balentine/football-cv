@@ -78,10 +78,15 @@ async def analyze(
     offense_direction: str = Form("right"),
     field_type: str = Form("college"),
     conf: float = Form(0.3),
+    ball_image_x: int | None = Form(None),
+    ball_image_y: int | None = Form(None),
 ):
     """Analyze a sideline football image.
 
     Accepts a JPEG/PNG image + game parameters.
+    Optional ball_image_x/y: pixel position of the ball in the image.
+    Providing this gives the homography solver an additional anchor and
+    significantly improves accuracy.
     Returns player positions, team assignments, and formation matches.
     """
     t0 = time.time()
@@ -95,11 +100,16 @@ async def analyze(
         raise HTTPException(status_code=400, detail="Could not decode image. Send a valid JPEG or PNG.")
 
     # ── 2. Run the full CV pipeline ──
+    ball_image_pos = None
+    if ball_image_x is not None and ball_image_y is not None:
+        ball_image_pos = (int(ball_image_x), int(ball_image_y))
+
     try:
         field_img, overlay, corr_debug, warped, summary, field_players, team_labels = (
             run_interactive_homography(
                 img_bgr,
                 ball_yard,
+                ball_image_pos=ball_image_pos,
                 conf=conf,
                 field_type=field_type,
                 offense_direction=offense_direction,

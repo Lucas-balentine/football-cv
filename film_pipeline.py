@@ -23,7 +23,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from presnap_extractor import extract_presnap_frames
-from interactive_homography import run_interactive_homography, _detect_yard_numbers
+from interactive_homography import run_interactive_homography
+try:
+    from interactive_homography import _detect_yard_numbers  # optional — removed from main pipeline
+except ImportError:
+    _detect_yard_numbers = None
 from build_formations import match_formation
 
 
@@ -87,7 +91,7 @@ def estimate_ball_yard(image_bgr: np.ndarray) -> tuple[int, str]:
         (ball_yard, source) where source is "detected" or "default".
     """
     h_img, w_img = image_bgr.shape[:2]
-    if min(h_img, w_img) >= 720:
+    if min(h_img, w_img) >= 720 and _detect_yard_numbers is not None:
         try:
             yard_numbers = _detect_yard_numbers(image_bgr)
             if len(yard_numbers) >= 2:

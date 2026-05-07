@@ -294,13 +294,18 @@ def _estimate_grid_vectors(
     pts = np.array(points, dtype=float)
     n = len(pts)
 
-    # ── Step 1: Collect 2-NN displacement vectors ────────────────────
+    # ── Step 1: Collect NN displacement vectors ────────────────────
+    # Use up to 4 nearest neighbours (was 2).  In wide sideline shots
+    # each point's 2 closest neighbours are often both along the same
+    # hash row, leaving the perpendicular direction unrepresented.
+    # Sampling 4 NN ensures both grid axes appear in the cluster.
+    k_nn = min(4, n - 1)
     nn_disps = []
     for i in range(n):
         dists = np.linalg.norm(pts - pts[i], axis=1)
         dists[i] = np.inf
-        nearest2 = np.argsort(dists)[:2]
-        for j in nearest2:
+        nearest = np.argsort(dists)[:k_nn]
+        for j in nearest:
             d = pts[j] - pts[i]
             # Canonicalize to positive-x half-plane
             if d[0] < -1 or (abs(d[0]) < 1 and d[1] < 0):
@@ -747,6 +752,8 @@ def compute_grid_homography(
     ball_image_pos: tuple[int, int] | None = None,
     ball_template_pos: tuple[int, int] | None = None,
     field_type: str = "college",
+    image_bgr: np.ndarray | None = None,
+    offense_direction: str | None = None,
 ) -> np.ndarray | None:
     """Compute homography from detected hash-yard intersections.
 
@@ -788,6 +795,158 @@ def compute_grid_homography(
 
     n_singles = len(singles)
 
+    # ── Yard-number correspondences (painted-value identification) ──
+    # Per the user's geometric insight: a painted yard number IS the yard
+    # line itself.  TL-30 + BL-30 + the two hashes between them all share
+    # ONE yard line.  The painted value (10/20/30/40/50) plus offense_direction
+    # uniquely identifies the internal yard.  We then VERIFY by checking
+    # there's a hash group at that same internal yard — if yes, the
+    # number is a confirmed anchor.
+
+    yard_number_anchors: list[tuple[float, float, float, float]] = []
+    if (image_bgr is not None and len(by_yard) >= 1
+            and grid.grid_vec_along is not None):
+        try:
+            _boxes, _confs, _labels = _run_player_detector(image_bgr)
+
+            vec_along = grid.grid_vec_along
+            v_along_x = float(vec_along[0])
+            v_along_y = float(vec_along[1])
+
+            # Hash group centroids in image space, indexed by yard
+            yard_centroids: dict[int, tuple[float, float]] = {}
+            for yard, pts in by_yard.items():
+                yard_centroids[yard] = (
+                    float(np.mean([p["x"] for p in pts])),
+                    float(np.mean([p["y"] for p in pts])),
+                )
+
+            # ── Step 1: bucket yard-number detections by painted value ──
+            # Ignore L/R suffix entirely.  We pair by painted value alone:
+            #   "tl-30", "tr-30" → all "top, painted value 30"
+            #   "bl-30", "br-30" → all "bottom, painted value 30"
+            tops_by_value: dict[int, list[dict]] = {}
+            bots_by_value: dict[int, list[dict]] = {}
+            for box, conf, label in zip(_boxes, _confs, _labels):
+                if "-" not in label:
+                    continue
+                prefix, num_str = label.split("-", 1)
+                if prefix not in ("b", "bl", "br", "t", "tl", "tr"):
+                    continue
+                try:
+                    val = int(num_str)
+                except ValueError:
+                    continue
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                d = {"x": cx, "y": cy, "label": label, "conf": conf}
+                if prefix.startswith("t"):
+                    tops_by_value.setdefault(val, []).append(d)
+                else:
+                    bots_by_value.setdefault(val, []).append(d)
+
+            # ── Step 2: pair top + bottom by painted value & vertical alignment ──
+            # Two detections share a yard line iff a line drawn through
+            # them follows the perspective slope (vec_along).
+            yard_lines: list[dict] = []
+            for val in set(tops_by_value) | set(bots_by_value):
+                tops = tops_by_value.get(val, [])
+                bots = bots_by_value.get(val, [])
+                used_bots: set[int] = set()
+                for t in tops:
+                    best_i, best_score = None, float("inf")
+                    for i, b in enumerate(bots):
+                        if i in used_bots:
+                            continue
+                        # Predicted bot.x given top.x + perspective shift
+                        dy = b["y"] - t["y"]
+                        if abs(v_along_y) < 1e-6:
+                            expected_bot_x = t["x"]
+                        else:
+                            expected_bot_x = t["x"] + dy * v_along_x / v_along_y
+                        score = abs(b["x"] - expected_bot_x)
+                        if score < best_score:
+                            best_score = score
+                            best_i = i
+                    if best_i is not None and best_score < 40:  # 40px slack
+                        used_bots.add(best_i)
+                        yard_lines.append({
+                            "value": val,
+                            "top": t,
+                            "bot": bots[best_i],
+                            "alignment_err": best_score,
+                        })
+
+            # Also keep singletons (T without B match, or B without T match)
+            # but only for value=50 (no L/R suffix possible for midfield)
+            for val in set(tops_by_value) | set(bots_by_value):
+                if val != 50:
+                    continue
+                for t in tops_by_value.get(val, []):
+                    if not any(yl["top"] is t for yl in yard_lines):
+                        yard_lines.append({"value": 50, "top": t, "bot": None,
+                                           "alignment_err": 0.0})
+                for b in bots_by_value.get(val, []):
+                    if not any(yl["bot"] is b for yl in yard_lines):
+                        yard_lines.append({"value": 50, "top": None, "bot": b,
+                                           "alignment_err": 0.0})
+
+            # ── Step 3: for each pair, find which hash group it matches ──
+            # The hash group whose centroid is closest to the yard line's
+            # extrapolated position at the hash row's image-y wins.
+            for yl in yard_lines:
+                t = yl["top"]
+                b = yl["bot"]
+                # Use whichever endpoint we have (or both)
+                if t and b:
+                    line_x_at_y = lambda y: t["x"] + (y - t["y"]) * (b["x"] - t["x"]) / max(b["y"] - t["y"], 1)
+                elif t:
+                    line_x_at_y = lambda y: t["x"] + (y - t["y"]) * v_along_x / max(v_along_y, 1)
+                else:
+                    line_x_at_y = lambda y: b["x"] + (y - b["y"]) * v_along_x / max(v_along_y, 1)
+
+                # Match to the hash group whose centroid lies closest to this line
+                best_yard = None
+                best_dist = float("inf")
+                for yard, (hx, hy) in yard_centroids.items():
+                    line_x = line_x_at_y(hy)
+                    dist = abs(hx - line_x)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_yard = yard
+
+                if best_yard is None or best_dist > 50:
+                    print(f"  [Y#] painted={yl['value']:2d} "
+                          f"(no hash group within 50px, dropped)", flush=True)
+                    continue
+
+                template_y = yard_to_template_y(best_yard)
+                if not (0 <= template_y <= TEMPLATE_H):
+                    continue
+
+                # Add anchors for whatever endpoints we have
+                if t is not None:
+                    yard_number_anchors.append(
+                        (t["x"], t["y"], float(_FAR_NUMBER_TEMPLATE_X), float(template_y))
+                    )
+                if b is not None:
+                    yard_number_anchors.append(
+                        (b["x"], b["y"], float(_NEAR_NUMBER_TEMPLATE_X), float(template_y))
+                    )
+                pair_str = f"{t['label']}+{b['label']}" if t and b else (
+                    t['label'] if t else b['label']
+                )
+                print(f"  [Y#] painted={yl['value']:2d} pair=({pair_str}) "
+                      f"→ matched yard={best_yard} (hash-dist={best_dist:.0f}px)",
+                      flush=True)
+
+            if yard_number_anchors:
+                print(f"[H] {len(yard_number_anchors)} yard-number anchors "
+                      f"({len(yard_lines)} yard-line pairs identified)", flush=True)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"[H] yard-number anchor extraction failed: {e}", flush=True)
+
     # ── Try both near/far orientations for multi-detection groups ─────
     # "highest image-y = near" doesn't hold for all camera angles.
     # Try normal and flipped, score by reprojection error.
@@ -827,6 +986,12 @@ def compute_grid_homography(
         if ball_image_pos is not None and ball_template_pos is not None:
             base_src.append([float(ball_image_pos[0]), float(ball_image_pos[1])])
             base_dst.append([float(ball_template_pos[0]), float(ball_template_pos[1])])
+
+        # Yard-number anchors are flip-invariant — same correspondence
+        # regardless of near/far orientation guess for multi-hash groups.
+        for img_x, img_y, tpl_x, tpl_y in yard_number_anchors:
+            base_src.append([img_x, img_y])
+            base_dst.append([tpl_x, tpl_y])
 
         if n_singles == 0:
             if len(base_src) < 4:
@@ -1530,8 +1695,332 @@ def _roboflow_detect(image_bgr: np.ndarray, confidence: int = 30) -> list[dict]:
     return results
 
 
+# ── Local segmentation (free, no Roboflow credits) ─────────────────────────
+#
+# Two modes, chosen by env var:
+#   SEG_BACKEND=sam2  (DEFAULT, best quality) — YOLO detects bounding boxes,
+#                      SAM2 segments inside each box.  Mirrors Roboflow's
+#                      seg-preview@v1 workflow we used previously.
+#   SEG_BACKEND=yolo  (fast fallback)        — YOLO11-seg only, masks come
+#                      directly from the segmentation head.
+
+_yolo_seg_model = None     # YOLO11-seg (fast path)
+_yolo_det_model = None     # YOLO11n / yolov8 person detector (for SAM prompting)
+_sam2_model = None         # SAM2 wrapped via Ultralytics
+
+_SEG_USE_API = os.getenv("SEG_USE_API", "0").strip().lower() in ("1", "true", "yes")
+_SEG_BACKEND = os.getenv("SEG_BACKEND", "sam2").strip().lower()
+
+
+def _get_yolo_seg_model():
+    """Load YOLO11 segmentation model (lazy, singleton).
+
+    Used only when SEG_BACKEND=yolo.  Returns one model that does both
+    detection and segmentation in a single forward pass.
+    """
+    global _yolo_seg_model
+    if _yolo_seg_model is None:
+        try:
+            from ultralytics import YOLO
+            model_name = os.getenv("SEG_MODEL", "yolo11m-seg.pt")
+            _yolo_seg_model = YOLO(model_name)
+        except Exception as e:
+            print(f"[SEG] Failed to load YOLO11-seg: {e}", flush=True)
+            return None
+    return _yolo_seg_model
+
+
+_PLAYER_DETECTOR_PATH = Path("models/player_detector.pt")
+
+
+def _get_yolo_det_model():
+    """Load player detector model (lazy, singleton).
+
+    Prefers the locally-trained 21-class football model at
+    ``models/player_detector.pt`` (player + ref + ball + 18 yard-number
+    variants).  Falls back to generic ``yolo11x.pt`` (COCO person class)
+    if the local file is missing.
+
+    Override with DET_MODEL env var.
+    """
+    global _yolo_det_model
+    if _yolo_det_model is None:
+        try:
+            from ultralytics import YOLO
+            override = os.getenv("DET_MODEL")
+            if override:
+                model_path = override
+            elif _PLAYER_DETECTOR_PATH.exists():
+                model_path = str(_PLAYER_DETECTOR_PATH)
+                print(f"[SEG] Loading custom player detector from {model_path}", flush=True)
+            else:
+                model_path = "yolo11x.pt"
+                print(f"[SEG] No custom detector found — using {model_path} (generic person)", flush=True)
+            _yolo_det_model = YOLO(model_path)
+        except Exception as e:
+            print(f"[SEG] Failed to load detector: {e}", flush=True)
+            return None
+    return _yolo_det_model
+
+
+# ── Yard-number class → (internal yard, sideline) lookup ────────────────────
+#
+# Class name encoding (from training dataset):
+#   prefix "b" / "bl" / "br" = BOTTOM of image = NEAR sideline (template_x small)
+#   prefix "t" / "tl" / "tr" = TOP of image    = FAR sideline  (template_x large)
+#   "l" / "r" suffix part:
+#     "l" = LEFT  of midfield → internal yard = N (e.g. bl-30 → yard 30)
+#     "r" = RIGHT of midfield → internal yard = 100 - N
+#     no l/r (just "b-50" / "t-50") → midfield → yard 50
+# Returns: (internal_yard:int, sideline:str) where sideline ∈ {"near","far"}
+
+_NEAR_NUMBER_TEMPLATE_X = 90   # 9 yards in from near sideline (NCAA)
+_FAR_NUMBER_TEMPLATE_X = 443   # 9 yards in from far sideline (TEMPLATE_W - 90)
+
+
+def _parse_yard_number_label(
+    label: str, offense_direction: str | None = None,
+) -> tuple[int, str] | None:
+    """Map a class label like 'bl-30' to (internal_yard, sideline).
+
+    L/R suffix is image-spatial (left/right of the 50 in the image), not
+    field-anchored.  Convert to internal yard 0–100 using offense_direction:
+
+    Convention (set by run_interactive_homography):
+      - offense_direction="right" → image-LEFT = internal yard 0
+        ⇒ "l" → N         "r" → 100 - N
+      - offense_direction="left"  → image-LEFT = internal yard 100
+        ⇒ "l" → 100 - N   "r" → N
+
+    sideline is image-position only:
+      - "b" prefix = bottom of image = NEAR sideline
+      - "t" prefix = top of image    = FAR  sideline
+    """
+    if "-" not in label:
+        return None
+    prefix, num = label.split("-", 1)
+    try:
+        n = int(num)
+    except ValueError:
+        return None
+    if prefix in ("b", "t") and n == 50:
+        return (50, "near" if prefix == "b" else "far")
+    if prefix in ("bl", "br", "tl", "tr") and n in (10, 20, 30, 40):
+        sideline = "near" if prefix.startswith("b") else "far"
+        is_image_left = prefix.endswith("l")
+        if offense_direction == "left":
+            # image-left = high internal yard
+            internal = (100 - n) if is_image_left else n
+        else:
+            # default / "right": image-left = low internal yard
+            internal = n if is_image_left else (100 - n)
+        return (internal, sideline)
+    return None
+
+
+def _get_sam2_model():
+    """Load SAM2 model (lazy, singleton).
+
+    Default: sam2.1_b.pt (~150MB, best quality/speed balance).
+    Override with SAM_MODEL env var (e.g., "sam2.1_t.pt" tiny ~40MB,
+    "sam2.1_s.pt" small ~80MB, "sam2.1_l.pt" large ~700MB).
+    """
+    global _sam2_model
+    if _sam2_model is None:
+        try:
+            from ultralytics import SAM
+            model_name = os.getenv("SAM_MODEL", "sam2.1_b.pt")
+            _sam2_model = SAM(model_name)
+        except Exception as e:
+            print(f"[SEG] Failed to load SAM2: {e}", flush=True)
+            return None
+    return _sam2_model
+
+
+def _segmentation_detect_yolo_only(
+    image_bgr: np.ndarray, confidence: float = 0.30,
+) -> list[dict]:
+    """Fast path: YOLO11-seg returns detections + masks in one shot."""
+    model = _get_yolo_seg_model()
+    if model is None:
+        return []
+
+    try:
+        results = model.predict(
+            image_bgr,
+            conf=confidence,
+            classes=[0],     # COCO class 0 = person
+            imgsz=640,
+            verbose=False,
+        )
+    except Exception as e:
+        print(f"[SEG] YOLO11-seg inference failed: {e}", flush=True)
+        return []
+
+    h, w = image_bgr.shape[:2]
+    out: list[dict] = []
+    for result in results:
+        if result.masks is None or result.boxes is None:
+            continue
+        masks_data = result.masks.data.cpu().numpy()
+        boxes = result.boxes
+        for i in range(len(boxes)):
+            x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().astype(int).tolist()
+            conf = float(boxes.conf[i].cpu().numpy())
+            mask = cv2.resize(
+                masks_data[i].astype(np.uint8) * 255,
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            out.append({
+                "bbox": (x1, y1, x2, y2),
+                "conf": conf,
+                "class": "player",
+                "mask": mask,
+            })
+    print(f"[SEG] YOLO11-seg → {len(out)} detections", flush=True)
+    return out
+
+
+# ── Cached detector inference ─────────────────────────────────────────────
+# Detection is run twice per pipeline invocation: once for yard-number
+# anchors (in compute_grid_homography), once for player segmentation
+# (here).  We cache the full prediction tensor keyed by image bytes so
+# the model only runs once per frame.
+
+_DET_CACHE: dict = {"key": None, "boxes": [], "confs": [], "labels": []}
+
+
+def _run_player_detector(
+    image_bgr: np.ndarray, confidence: float = 0.20,
+) -> tuple[list[list[float]], list[float], list[str]]:
+    """Run the player+ref+number detector and cache results for this frame.
+
+    Returns (bboxes_xyxy, confs, labels) for all classes.  Caller filters
+    by class label as needed.
+    """
+    # Cheap cache key: object identity — same numpy array within one
+    # pipeline invocation has the same id().  Avoids numpy bitwise ops
+    # that fail on some dtypes.
+    key = id(image_bgr)
+    if _DET_CACHE["key"] == key:
+        return _DET_CACHE["boxes"], _DET_CACHE["confs"], _DET_CACHE["labels"]
+
+    model = _get_yolo_det_model()
+    if model is None:
+        return [], [], []
+
+    try:
+        results = model.predict(
+            image_bgr,
+            conf=confidence,
+            iou=0.60,
+            imgsz=960,
+            verbose=False,
+            max_det=80,
+        )
+    except Exception as e:
+        print(f"[DET] inference failed: {e}", flush=True)
+        return [], [], []
+
+    names = model.names if hasattr(model, "names") else {}
+    boxes: list[list[float]] = []
+    confs: list[float] = []
+    labels: list[str] = []
+    for r in results:
+        if r.boxes is None:
+            continue
+        for i in range(len(r.boxes)):
+            cls_id = int(r.boxes.cls[i].cpu().numpy())
+            label = names.get(cls_id, f"class{cls_id}")
+            boxes.append(r.boxes.xyxy[i].cpu().numpy().tolist())
+            confs.append(float(r.boxes.conf[i].cpu().numpy()))
+            labels.append(label)
+
+    _DET_CACHE.update({"key": key, "boxes": boxes, "confs": confs, "labels": labels})
+    return boxes, confs, labels
+
+
+def _segmentation_detect_sam2(
+    image_bgr: np.ndarray, confidence: float = 0.20,
+) -> list[dict]:
+    """High-quality path: detect → SAM2 mask refinement, players only.
+
+    The custom 21-class detector returns players, refs, ball, and yard
+    numbers.  We:
+      - segment ONLY players (refs are dropped, yard numbers and ball
+        flow to other consumers)
+      - return one dict per player with bbox, mask, conf
+
+    Yard-number detections are cached for compute_grid_homography().
+    """
+    sam_model = _get_sam2_model()
+    if sam_model is None:
+        return []
+
+    all_boxes, all_confs, all_labels = _run_player_detector(image_bgr, confidence)
+
+    # Filter to players only — refs and yard numbers are not segmented
+    bboxes_xyxy = []
+    confs = []
+    for box, c, lbl in zip(all_boxes, all_confs, all_labels):
+        if lbl == "player":
+            bboxes_xyxy.append(box)
+            confs.append(c)
+
+    n_refs = sum(1 for l in all_labels if l == "ref")
+    n_numbers = sum(1 for l in all_labels if "-" in l)
+    print(f"[DET] {len(bboxes_xyxy)} players, {n_refs} refs, "
+          f"{n_numbers} yard numbers (refs dropped)", flush=True)
+
+    if not bboxes_xyxy:
+        return []
+
+    # Step 2: SAM2 mask each bbox
+    try:
+        sam_results = sam_model(image_bgr, bboxes=bboxes_xyxy, verbose=False)
+    except Exception as e:
+        print(f"[SEG] SAM2 inference failed: {e}", flush=True)
+        return []
+
+    h, w = image_bgr.shape[:2]
+    out: list[dict] = []
+    for r in sam_results:
+        if r.masks is None:
+            continue
+        masks_data = r.masks.data.cpu().numpy()  # (N, mh, mw)
+        for i, mask_lowres in enumerate(masks_data):
+            if i >= len(bboxes_xyxy):
+                break
+            x1, y1, x2, y2 = (int(v) for v in bboxes_xyxy[i])
+            mask = cv2.resize(
+                mask_lowres.astype(np.uint8) * 255,
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            out.append({
+                "bbox": (x1, y1, x2, y2),
+                "conf": confs[i],
+                "class": "player",
+                "mask": mask,
+            })
+
+    print(f"[SEG] YOLO+SAM2 → {len(out)} detections", flush=True)
+    return out
+
+
+def _segmentation_detect_local(
+    image_bgr: np.ndarray, confidence: float = 0.30,
+) -> list[dict]:
+    """Dispatch to the chosen local backend (SAM2 by default, YOLO fallback)."""
+    if _SEG_BACKEND == "yolo":
+        return _segmentation_detect_yolo_only(image_bgr, confidence)
+    # Default: SAM2 for best quality
+    return _segmentation_detect_sam2(image_bgr, confidence)
+
+
 def _segmentation_detect(image_bgr: np.ndarray) -> list[dict]:
-    """Call Roboflow segmentation workflow for player detection.
+    """Player segmentation — local YOLO11-seg first, Roboflow API fallback.
 
     Returns list of dicts with keys:
         bbox: (x1, y1, x2, y2)
@@ -1539,7 +2028,17 @@ def _segmentation_detect(image_bgr: np.ndarray) -> list[dict]:
         class: str ("player" or "ref")
         mask: np.ndarray (binary mask for this player, same size as image)
     Returns empty list on failure.
+
+    Set SEG_USE_API=1 to force the Roboflow path.
     """
+    # Local first (no credits used)
+    if not _SEG_USE_API:
+        local = _segmentation_detect_local(image_bgr)
+        if local:
+            return local
+        # If local model failed to load or returned nothing, try API
+        print("[SEG] Local seg empty/failed — trying Roboflow API", flush=True)
+
     try:
         from inference_sdk import InferenceHTTPClient
     except ImportError:
@@ -2091,6 +2590,8 @@ def run_interactive_homography(
                 ball_image_pos=ball_image_pos,
                 ball_template_pos=ball_template_pos,
                 field_type=field_type,
+                image_bgr=image,
+                offense_direction=offense_direction,
             )
             if H is not None:
                 homography_source = "grid"
@@ -2108,8 +2609,9 @@ def run_interactive_homography(
         overlay = image.copy()
 
     if H is None:
-        msg = "Homography failed (both grid and Hough)"
-        return ph, overlay, image.copy(), ph, msg
+        msg = "Homography failed (hash-based detection unsuccessful)"
+        # Match the success path's 7-tuple shape so callers don't crash
+        return ph, overlay, image.copy(), ph, msg, [], []
 
     # Step 4: Blended player detection
     players = detect_player_positions(image, conf)

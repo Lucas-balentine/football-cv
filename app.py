@@ -329,69 +329,147 @@ def run_roboflow_detection(
 
 def run_homography(
     image_bgr: np.ndarray,
+    ball_yard: int = 50,
+    offense_direction: str = "right",
+    field_type: str = "college",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    """Field homography.  Returns (lines_debug, birdseye, blend, summary)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir) / "input.jpg"
-        cv2.imwrite(str(tmp_path), image_bgr)
-        out = Path(tmpdir)
+    """Field homography — uses OUR trained pipeline.
 
-        H = estimate_homography(str(tmp_path), out)
+    Inputs to the homography solver:
+      - Hash YOLO (custom local model, models/hash_intersection.pt) for
+        hash-mark × yard-line intersections
+      - Ball position (defaulted to mid-field if none provided)
+      - Yard-step propagation from ball_yard + offense_direction
 
-        def _read(suffix: str) -> np.ndarray | None:
-            p = out / f"input_{suffix}.jpg"
-            if p.exists():
-                return cv2.imread(str(p))
-            return None
+    Returns (detected_lines_debug, birdseye, blend, summary).
+    No Hough lines, no Roboflow API — purely our trained models.
+    """
+    from interactive_homography import (
+        detect_field_grid,
+        compute_grid_homography,
+        draw_field_overlay,
+        _hash_template_x,
+        TEMPLATE_W as IH_TEMPLATE_W,
+        TEMPLATE_H as IH_TEMPLATE_H,
+    )
 
-        lines_img = _read("lines_debug")
-        birds_img = _read("birdseye")
-        blend_img = _read("blend")
+    h_img, w_img = image_bgr.shape[:2]
 
-        if H is None:
-            msg = "Homography failed (not enough lines detected)"
-            ph = _placeholder(text=msg)
-            return (
-                lines_img if lines_img is not None else ph,
-                ph,
-                ph,
-                msg,
-            )
+    # Default ball anchor: middle of frame
+    ball_image_pos = (w_img // 2, h_img // 2)
+    near_x, far_x = _hash_template_x(field_type)
+    ball_template_pos = (
+        (near_x + far_x) // 2,
+        100 + ball_yard * 10,  # yard_to_template_y
+    )
 
-        inliers = "unknown"
-        summary = f"Homography computed successfully"
-        return (
-            lines_img if lines_img is not None else _placeholder(),
-            birds_img if birds_img is not None else _placeholder(),
-            blend_img if blend_img is not None else _placeholder(),
-            summary,
+    # Run grid detection (uses local hash model)
+    grid = detect_field_grid(
+        image_bgr,
+        ball_yard,
+        ball_image_pos=ball_image_pos,
+        offense_direction=offense_direction,
+    )
+
+    detected = [p for p in grid.projected_intersections if p["detected"]]
+
+    # Build lines_debug image: input + every detected hash mark with confidence
+    lines_debug = image_bgr.copy()
+    for p in grid.detections:
+        if p.get("class") not in ("hash", "hash-yard-intersection"):
+            continue
+        cx, cy = int(p["x"]), int(p["y"])
+        recovered = p.get("_recovered", False)
+        color = (0, 255, 255) if not recovered else (0, 180, 180)
+        cv2.circle(lines_debug, (cx, cy), 6, color, 2)
+        cv2.putText(lines_debug, f"{p['confidence']:.2f}",
+                    (cx + 8, cy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    if len(detected) < 3:
+        ph = _placeholder(text=f"Only {len(detected)} hash points detected (need 3+)")
+        return lines_debug, ph, ph, (
+            f"Hash detector found {len(detected)} hash-yard intersections.\n"
+            f"Need at least 3 to compute homography. Try a clearer/wider sideline frame."
         )
+
+    # Compute homography
+    H = compute_grid_homography(
+        grid, image_bgr.shape,
+        ball_image_pos=ball_image_pos,
+        ball_template_pos=ball_template_pos,
+        field_type=field_type,
+        image_bgr=image_bgr,
+        offense_direction=offense_direction,
+    )
+
+    if H is None:
+        ph = _placeholder(text="Homography solver returned None")
+        return lines_debug, ph, ph, (
+            f"Hash points: {len(detected)}\n"
+            f"Yard-line groups: {len(grid.yard_line_groups)}\n"
+            f"Solver failed to find a valid homography."
+        )
+
+    # Bird's-eye warp
+    birds = cv2.warpPerspective(image_bgr, H, (IH_TEMPLATE_W, IH_TEMPLATE_H))
+
+    # Blend the warped image with a synthesized field template for context
+    from field_homography import draw_field_template
+    template = draw_field_template()
+    blend = cv2.addWeighted(template, 0.5, birds, 0.5, 0)
+
+    # Reproj error: distance from each detected hash to its expected
+    # template position via H
+    src_pts = np.array(
+        [[p["x"], p["y"]] for p in detected], dtype=np.float32
+    ).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(src_pts, H).reshape(-1, 2)
+    # Just get a rough "median forward-projection sanity" by checking spread
+    proj_xs = projected[:, 0]
+    proj_ys = projected[:, 1]
+
+    summary_parts = [
+        "── Trained model outputs ──",
+        f"Hash YOLO detections: {len(detected)}",
+        f"Yard-line groups: {len(grid.yard_line_groups)}",
+        f"Ball anchor: image=({ball_image_pos[0]},{ball_image_pos[1]}) yard={ball_yard}",
+        f"Offense direction: {offense_direction}",
+        "",
+        "── Homography sanity ──",
+        f"Projected x range: {proj_xs.min():.0f} → {proj_xs.max():.0f}",
+        f"Projected y range: {proj_ys.min():.0f} → {proj_ys.max():.0f}",
+        f"Template W={IH_TEMPLATE_W} H={IH_TEMPLATE_H}",
+    ]
+    return lines_debug, birds, blend, "\n".join(summary_parts)
 
 
 def run_numbers(
     image_bgr: np.ndarray,
 ) -> tuple[np.ndarray, str]:
-    """Field number detection via Roboflow model.  Returns (annotated, summary)."""
-    from inference_sdk import InferenceHTTPClient
+    """Field number detection via the LOCAL custom 21-class detector.
 
-    client = InferenceHTTPClient(
-        api_url="https://serverless.roboflow.com",
-        api_key=os.getenv("ROBOFLOW_API_KEY", "WCQqMdQpSXVfNVwr7Xcj"),
-    )
+    Previously called Roboflow's hosted football-field-tkgnq/13 model;
+    that path returns 404 for keys that don't own the project.  Now uses
+    the locally-trained models/player_detector.pt — same 21 classes
+    (ball, player, ref, b-50, bl-10..bl-40, br-10..br-40, t-50,
+    tl-10..tl-40, tr-10..tr-40), zero API cost, zero credit usage.
+    """
+    from interactive_homography import _run_player_detector
 
-    # Encode image for API
-    _, buf = cv2.imencode(".jpg", image_bgr)
-    import tempfile as _tf
-    with _tf.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        f.write(buf.tobytes())
-        tmp_path = f.name
+    boxes, confs, labels = _run_player_detector(image_bgr)
 
-    try:
-        result = client.infer(tmp_path, model_id="football-field-tkgnq/13")
-    finally:
-        os.unlink(tmp_path)
-
-    preds = result.get("predictions", [])
+    # Adapt to the same dict shape the rest of this function expects
+    preds = []
+    for box, conf, lbl in zip(boxes, confs, labels):
+        x1, y1, x2, y2 = box
+        preds.append({
+            "x": (x1 + x2) / 2,
+            "y": (y1 + y2) / 2,
+            "width": x2 - x1,
+            "height": y2 - y1,
+            "confidence": float(conf),
+            "class": lbl,
+        })
 
     # Color map by class type
     CLASS_COLORS = {
@@ -433,7 +511,7 @@ def run_numbers(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
     # Build summary
-    parts = [f"Football Field Model (football-field-tkgnq/13)", f"Total: {len(preds)} detections", ""]
+    parts = [f"Custom 21-class detector (models/player_detector.pt)", f"Total: {len(preds)} detections", ""]
     if number_dets:
         parts.append("Field numbers:")
         for cls, conf, cx, cy in sorted(number_dets, key=lambda x: x[0]):
@@ -449,31 +527,122 @@ def run_numbers(
 def run_markings(
     image_bgr: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
-    """Field marking detection.  Returns (debug_annotated, debug_panel, white_mask, lc_mask, summary)."""
-    field_mask = build_field_mask(image_bgr)
-    player_mask = _build_player_mask(image_bgr)
+    """Field marking detection — uses OUR trained models.
 
-    markings = detect_field_markings(image_bgr, field_mask, player_mask)
-    debug = draw_markings_debug(image_bgr, markings)
-    panel = draw_markings_panel(image_bgr, markings)
+    Combines:
+      - Hash YOLO → individual hash-mark × yard-line intersections
+      - 21-class detector → painted yard numbers (b-50, bl-10, tr-30, etc.)
+      - Grid clustering → grouped yard lines
 
-    # Debug masks
-    white_mask = detect_white_mask_clean(image_bgr, field_mask, player_mask)
-    lc_mask = detect_local_contrast_mask(image_bgr, field_mask, player_mask)
+    Returns (debug_annotated, panel_with_grid, hash_only, numbers_only, summary).
+    """
+    from interactive_homography import (
+        _hash_intersection_predict,
+        _run_player_detector,
+        detect_field_grid,
+    )
+
+    # ── Run BOTH models ──────────────────────────────────────────────
+    hash_preds = _hash_intersection_predict(image_bgr, confidence=15)
+    boxes, confs, labels = _run_player_detector(image_bgr)
+
+    # Filter to yard-number labels (drop ball/player/ref)
+    number_dets = []
+    for box, conf, lbl in zip(boxes, confs, labels):
+        if "-" not in lbl:
+            continue
+        prefix = lbl.split("-", 1)[0]
+        if prefix in ("b", "bl", "br", "t", "tl", "tr"):
+            number_dets.append((box, float(conf), lbl))
+
+    # ── Combined debug overlay ───────────────────────────────────────
+    debug = image_bgr.copy()
+    HASH_COLOR = (0, 255, 255)         # cyan
+    NUMBER_COLOR = (0, 200, 255)       # amber
+
+    for p in hash_preds:
+        if p.get("class") not in ("hash", "hash-yard-intersection"):
+            continue
+        cx, cy = int(p["x"]), int(p["y"])
+        cv2.circle(debug, (cx, cy), 5, HASH_COLOR, 2)
+        cv2.putText(debug, f"{p['confidence']:.2f}",
+                    (cx + 7, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, HASH_COLOR, 1)
+
+    for box, conf, lbl in number_dets:
+        x1, y1, x2, y2 = (int(v) for v in box)
+        cv2.rectangle(debug, (x1, y1), (x2, y2), NUMBER_COLOR, 2)
+        cv2.putText(debug, lbl, (x1, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, NUMBER_COLOR, 1)
+
+    # ── Panel with yard-line grouping (using grid clustering) ──────
+    grid = detect_field_grid(image_bgr, ball_yard=50, offense_direction="right")
+    panel = image_bgr.copy()
+    GROUP_COLORS = [
+        (255, 100, 100), (100, 255, 100), (100, 100, 255),
+        (255, 255, 100), (100, 255, 255), (255, 100, 255),
+        (200, 150, 50),  (50, 200, 150),  (150, 50, 200),
+        (255, 200, 0),   (0, 200, 255),
+    ]
+    for i, group in enumerate(grid.yard_line_groups):
+        if not group.get("detected"):
+            continue
+        col = GROUP_COLORS[i % len(GROUP_COLORS)]
+        for pt in group["points"]:
+            cv2.circle(panel, (int(pt["x"]), int(pt["y"])), 7, col, 3)
+        cx, cy = group["centroid"]
+        cv2.putText(panel, f"yd{group['yard']}", (int(cx) - 15, int(cy) - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 2)
+
+    # ── Hash-only image ──────────────────────────────────────────────
+    hash_only = image_bgr.copy()
+    for p in hash_preds:
+        if p.get("class") not in ("hash", "hash-yard-intersection"):
+            continue
+        cx, cy = int(p["x"]), int(p["y"])
+        cv2.circle(hash_only, (cx, cy), 8, HASH_COLOR, -1)
+
+    # ── Numbers-only image ───────────────────────────────────────────
+    numbers_only = image_bgr.copy()
+    for box, conf, lbl in number_dets:
+        x1, y1, x2, y2 = (int(v) for v in box)
+        cv2.rectangle(numbers_only, (x1, y1), (x2, y2), NUMBER_COLOR, 2)
+        (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(numbers_only, (x1, y1 - th - 6), (x1 + tw + 4, y1), NUMBER_COLOR, -1)
+        cv2.putText(numbers_only, lbl, (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+    # ── Summary ──────────────────────────────────────────────────────
+    n_hashes = sum(1 for p in hash_preds if p.get("class") in ("hash", "hash-yard-intersection"))
+    detected_yards = sorted({g["yard"] for g in grid.yard_line_groups if g.get("detected")})
+
+    label_counts: dict[str, int] = {}
+    for _, _, lbl in number_dets:
+        label_counts[lbl] = label_counts.get(lbl, 0) + 1
 
     parts = [
-        f"Dominant angle: {markings.dominant_angle:.1f}°",
-        f"Yard lines: {len(markings.yard_lines)}",
-        f"Sidelines: {len(markings.sidelines)}",
-        f"Hash marks: {len(markings.hash_marks)}",
-        f"Hash mark rows: {len(markings.hash_rows)}",
+        "── Hash detections (custom YOLO11n) ──",
+        f"  Total hash marks: {n_hashes}",
+        f"  Detected yard groups: {len(grid.yard_line_groups)}",
+        f"  Yards covered: {detected_yards}",
+        "",
+        "── Yard numbers (custom 21-class) ──",
+        f"  Total number detections: {len(number_dets)}",
     ]
-    for row in markings.hash_rows:
-        label = row.label or "unlabeled"
-        parts.append(f"  Row '{label}': {len(row.marks)} marks, lateral={row.lateral_position:.0f}")
-    parts.append(f"Total segments: {len(markings.all_segments)}")
+    for lbl in sorted(label_counts):
+        parts.append(f"  {lbl}: {label_counts[lbl]}")
+
+    if grid.grid_vec_along is not None and grid.grid_vec_across is not None:
+        parts += [
+            "",
+            "── Grid geometry ──",
+            f"  vec_along  (yard-line direction): "
+            f"({grid.grid_vec_along[0]:.1f}, {grid.grid_vec_along[1]:.1f})",
+            f"  vec_across (between yard lines):  "
+            f"({grid.grid_vec_across[0]:.1f}, {grid.grid_vec_across[1]:.1f})",
+        ]
+
     summary = "\n".join(parts)
-    return debug, panel, white_mask, lc_mask, summary
+    return debug, panel, hash_only, numbers_only, summary
 
 
 # ── Hash-yards intersection detection ────────────────────────────────────
@@ -1740,23 +1909,28 @@ def build_app() -> gr.Blocks:
 
             # ── Tab 3: Field homography ──────────────────────────────────
             with gr.TabItem("Field Homography"):
+                gr.Markdown(
+                    "**Pipeline:** custom hash YOLO → grid clustering → "
+                    "RANSAC homography solve. No Hough lines, no Roboflow API."
+                )
                 with gr.Row():
-                    lines_output = gr.Image(label="Detected lines")
-                    birds_output = gr.Image(label="Bird's-eye view")
-                    blend_output = gr.Image(label="Blended overlay")
-                hom_summary = gr.Textbox(label="Summary", lines=2)
+                    lines_output = gr.Image(label="Hash detections (cyan circles)")
+                    birds_output = gr.Image(label="Bird's-eye view (warped to template)")
+                    blend_output = gr.Image(label="Template + warped image blend")
+                hom_summary = gr.Textbox(label="Summary", lines=12)
 
             # ── Tab 4: Field markings ──────────────────────────────────
             with gr.TabItem("Field Markings"):
-                mk_output = gr.Image(label="Classified markings")
-                mk_panel = gr.Image(label="Debug panel (4-stage pipeline)")
+                mk_output = gr.Image(label="All markings (hash YOLO + 21-class detector)")
+                mk_panel = gr.Image(label="Yard-line groups (clustered hash detections)")
                 with gr.Row():
-                    mk_white = gr.Image(label="White mask (strict HSV)")
-                    mk_lc = gr.Image(label="Hash mark mask (local contrast)")
-                mk_summary = gr.Textbox(label="Summary", lines=5)
+                    mk_white = gr.Image(label="Hash marks only")
+                    mk_lc = gr.Image(label="Yard numbers only")
+                mk_summary = gr.Textbox(label="Summary", lines=10)
                 gr.Markdown(
-                    "*Colors: green=yard lines, blue=sidelines, "
-                    "yellow=hash marks, orange=tick marks*"
+                    "*Cyan = hash-yard intersections (custom YOLO11n). "
+                    "Amber = painted yard numbers (custom 21-class). "
+                    "Each color block in panel = one detected yard line.*"
                 )
                 gr.Markdown("---")
                 gr.Markdown(
@@ -1772,13 +1946,14 @@ def build_app() -> gr.Blocks:
             # ── Tab 5: Field Numbers (Roboflow) ──────────────────────────
             with gr.TabItem("Field Numbers"):
                 gr.Markdown(
-                    "### Roboflow Field Detection Model\n"
-                    "Detects field yard numbers (`tl-30`, `tr-40`, `t-50`, etc.), "
-                    "players, refs, and ball. Yellow = field numbers, "
-                    "green = players, gray = refs, orange = ball."
+                    "### Custom 21-class detector (`models/player_detector.pt`)\n"
+                    "Local model trained on 13,879 images. Detects yard numbers "
+                    "(`tl-30`, `tr-40`, `t-50`, etc.), players, refs, and ball. "
+                    "Yellow = yard numbers, green = players, gray = refs, "
+                    "orange = ball. **Zero API cost.**"
                 )
-                num_output = gr.Image(label="Detections")
-                num_summary = gr.Textbox(label="Summary", lines=10)
+                num_output = gr.Image(label="Detections (custom 21-class model)")
+                num_summary = gr.Textbox(label="Summary", lines=12)
 
             # ── Tab 6: Segmentation ───────────────────────────────────
             with gr.TabItem("Segmentation"):
@@ -2769,47 +2944,86 @@ def build_app() -> gr.Blocks:
                     return gr.update(choices=videos, value=videos[0] if videos else None)
 
                 def _ps_run_extraction(video_path, min_dur, scene_thresh):
-                    """Run the 3-layer pre-snap extraction pipeline."""
+                    """Run the 3-layer pre-snap extraction pipeline.
+
+                    Generator: yields (gallery, progress_text, results, info)
+                    after each progress update so the UI shows live status
+                    with an elapsed-seconds counter.
+                    """
+                    import time as _time
+                    import threading as _threading
+
                     if not video_path or not os.path.exists(video_path):
-                        return (
+                        yield (
                             [],
                             f"Video not found: {video_path!r}",
                             [],
                             "",
                         )
+                        return
 
                     video_stem = Path(video_path).stem
                     out_dir = f"videos/presnap/{video_stem}"
 
-                    # Progress messages accumulate here
-                    status_lines = []
+                    t_start = _time.time()
+                    latest_msg = ["Starting extraction…"]
 
                     def _progress(current, total, msg):
-                        status_lines.append(msg)
+                        latest_msg[0] = msg
 
-                    try:
-                        results = extract_presnap_frames(
-                            video_path,
-                            out_dir,
-                            min_segment_duration=min_dur,
-                            scene_threshold=scene_thresh,
-                            progress_callback=_progress,
-                        )
-                    except Exception as e:
-                        return (
+                    # Run extraction in a background thread so we can
+                    # yield progress updates while it works.
+                    state = {"results": None, "error": None, "done": False}
+
+                    def _worker():
+                        try:
+                            state["results"] = extract_presnap_frames(
+                                video_path,
+                                out_dir,
+                                min_segment_duration=min_dur,
+                                scene_threshold=scene_thresh,
+                                progress_callback=_progress,
+                            )
+                        except Exception as e:
+                            state["error"] = str(e)
+                        finally:
+                            state["done"] = True
+
+                    thread = _threading.Thread(target=_worker, daemon=True)
+                    thread.start()
+
+                    # Stream progress every 0.5s while the worker runs
+                    while not state["done"]:
+                        elapsed = int(_time.time() - t_start)
+                        yield (
                             [],
-                            f"Error: {e}",
+                            f"⏱ {elapsed}s — {latest_msg[0]}",
                             [],
                             "",
                         )
+                        _time.sleep(0.5)
 
+                    elapsed_total = int(_time.time() - t_start)
+
+                    if state["error"]:
+                        yield (
+                            [],
+                            f"Error after {elapsed_total}s: {state['error']}",
+                            [],
+                            "",
+                        )
+                        return
+
+                    results = state["results"]
                     if not results:
-                        return (
+                        yield (
                             [],
-                            "No pre-snap frames found. Try adjusting sensitivity.",
+                            f"No pre-snap frames found after {elapsed_total}s. "
+                            "Try adjusting sensitivity.",
                             [],
                             "",
                         )
+                        return
 
                     # Build gallery entries: list of (filepath, label) tuples
                     gallery_items = []
@@ -2821,8 +3035,8 @@ def build_app() -> gr.Blocks:
                         gallery_items.append((r["output_path"], label))
 
                     summary = (
-                        f"Extracted {len(results)} pre-snap frames from "
-                        f"{len(status_lines)} segments.\n"
+                        f"✓ Extracted {len(results)} pre-snap frames in "
+                        f"{elapsed_total}s.\n"
                         f"Saved to: {out_dir}/\n"
                         f"High confidence: "
                         f"{sum(1 for r in results if r['confidence'] == 'high')}, "
@@ -2830,7 +3044,7 @@ def build_app() -> gr.Blocks:
                         f"{sum(1 for r in results if r['confidence'] == 'medium')}"
                     )
 
-                    return gallery_items, summary, results, ""
+                    yield gallery_items, summary, results, ""
 
                 def _ps_select_frame(evt: gr.SelectData, results):
                     """Show info about the selected gallery frame."""
